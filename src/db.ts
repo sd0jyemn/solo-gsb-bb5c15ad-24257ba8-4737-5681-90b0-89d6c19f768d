@@ -2,6 +2,7 @@ import Database, { Database as DB } from 'better-sqlite3';
 import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import type { AnalyticsDecisionRow } from './analytics';
 import { EntryRow, HeaderMap, TokenRow } from './types';
 import { generateToken, sha256, stableStringify } from './util';
 
@@ -764,6 +765,40 @@ export class CacheStore {
     }));
   }
 
+  /**
+   * 分析用只读查询：取虚拟时间落在半开区间 [virtualFrom, virtualTo) 内的判定。
+   * normalizedPrefix 给出时，按规范化 URL 前缀过滤（调用方负责转义 LIKE 元字符）。
+   * 结果按 (virtual_time, id) 稳定升序，供时间桶聚合。
+   */
+  listDecisionLogsForAnalytics(params: {
+    virtualFrom: number;
+    virtualTo: number;
+    normalizedPrefix: string | null;
+  }): AnalyticsDecisionRow[] {
+    const rows =
+      params.normalizedPrefix === null
+        ? this.db
+            .prepare(
+              `SELECT id, virtual_time, state, trail_json FROM decision_logs
+                WHERE virtual_time >= ? AND virtual_time < ?
+                ORDER BY virtual_time ASC, id ASC`
+            )
+            .all(params.virtualFrom, params.virtualTo)
+        : this.db
+            .prepare(
+              `SELECT id, virtual_time, state, trail_json FROM decision_logs
+                WHERE virtual_time >= ? AND virtual_time < ?
+                  AND normalized_url LIKE ? ESCAPE '\\'
+                ORDER BY virtual_time ASC, id ASC`
+            )
+            .all(
+              params.virtualFrom,
+              params.virtualTo,
+              escapeLikePrefix(params.normalizedPrefix)
+            );
+    return rows as AnalyticsDecisionRow[];
+  }
+
   // —— 重置 / 统计 ——
 
   reset(): void {
@@ -797,6 +832,14 @@ export class CacheStore {
 function readEtag(responseHeadersJson: string): string | null {
   const headers = JSON.parse(responseHeadersJson) as HeaderMap;
   return headers['etag'] ?? null;
+}
+
+/**
+ * 把任意字符串转成「按字面量做前缀匹配」的 LIKE 模式：
+ * 反斜杠（ESCAPE 符）与 %/_ 先转义，末尾补 %。
+ */
+function escapeLikePrefix(prefix: string): string {
+  return prefix.replace(/[\\%_]/g, (c) => '\\' + c) + '%';
 }
 
 function parseVaryNames(value: string | undefined): string[] {  if (!value) return [];

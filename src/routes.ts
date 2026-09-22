@@ -5,9 +5,11 @@ import {
   InvalidationTarget,
   RevalidationConflictError,
 } from './db';
+import { buildAnalytics } from './analytics';
 import {
   computeCacheKey,
   normalizeUrl,
+  NormalizeError,
   parseVary,
   selectVaryHeaders,
 } from './canonical';
@@ -56,6 +58,15 @@ interface InvalidatePayload {
   requestId?: unknown;
 }
 
+interface AnalyticsPayload {
+  virtualFrom?: unknown;
+  virtualTo?: unknown;
+  /** 桶宽（秒），正整数 */
+  bucketSeconds?: unknown;
+  /** 可选：按规范化 URL 前缀过滤判定 */
+  urlPrefix?: unknown;
+}
+
 export default function registerRoutes(app: FastifyInstance, store: CacheStore): void {
   // —— 基础信息 ——
   app.get('/', async () => ({
@@ -70,6 +81,7 @@ export default function registerRoutes(app: FastifyInstance, store: CacheStore):
       'GET  /cache/tokens': '查看令牌（?all=1 含已结束）',
       'GET  /cache/entries': '查看缓存条目',
       'GET  /cache/decisions': '查看判定轨迹日志',
+      'POST /cache/analytics': '按虚拟时间区间+时间桶聚合判定（状态计数 / Age p95 / 单飞领队率）',
       'GET  /cache/stats': '计数',
       'POST /admin/entries': '预置模拟响应',
       'DELETE /admin/entries/:cacheKey': '删除单个条目',
@@ -427,6 +439,57 @@ export default function registerRoutes(app: FastifyInstance, store: CacheStore):
   app.get('/cache/decisions', async (req) => {
     const q = req.query as { limit?: string };
     return { decisions: store.listDecisionLogs(clampLimit(q.limit)) };
+  });
+
+  // —— 只读分析：按虚拟时间桶聚合判定日志（不改任何缓存数据）——
+  app.post('/cache/analytics', async (_req, reply) => {
+    const body = (_req.body ?? {}) as AnalyticsPayload;
+
+    const virtualFrom = parseVirtualTime(body.virtualFrom, 'virtualFrom');
+    const virtualTo = parseVirtualTime(body.virtualTo, 'virtualTo');
+    if (virtualTo <= virtualFrom) {
+      throw new ValidationError(
+        `区间非法：virtualFrom(${virtualFrom}) 必须严格小于 virtualTo(${virtualTo})（半开 [virtualFrom, virtualTo)）`
+      );
+    }
+    const bucketSeconds = asPositiveInteger(body.bucketSeconds, 'bucketSeconds');
+
+    // 桶网格以 virtualFrom 为原点；限制桶数，避免超大区间 + 极小桶宽打爆响应
+    const spanMs = virtualTo - virtualFrom;
+    const bucketCount = Math.ceil(spanMs / (bucketSeconds * 1000));
+    if (bucketCount > MAX_ANALYTICS_BUCKETS) {
+      throw new ValidationError(
+        `桶数过多：区间 ${spanMs}ms / ${bucketSeconds}s = ${bucketCount} 桶，上限 ${MAX_ANALYTICS_BUCKETS} 桶，请加大 bucketSeconds 或缩小区间`
+      );
+    }
+
+    // 前缀按规范化 URL 匹配（与缓存键中的 URL 口径一致）：
+    // 可给完整 URL 规范化，也可只给到目录/host 前缀。
+    let normalizedPrefix: string | null = null;
+    const rawPrefix = asOptionalString(body.urlPrefix, 'urlPrefix');
+    if (rawPrefix !== undefined) {
+      normalizedPrefix = normalizeAnalyticsPrefix(rawPrefix);
+    }
+
+    const rows = store.listDecisionLogsForAnalytics({
+      virtualFrom,
+      virtualTo,
+      normalizedPrefix,
+    });
+    const result = buildAnalytics({
+      virtualFrom,
+      virtualTo,
+      bucketSeconds,
+      urlPrefix: normalizedPrefix,
+      rows,
+    });
+
+    return reply.code(200).send({
+      ...result,
+      interval: 'half-open [virtualFrom, virtualTo)',
+      bucketsEndpoint: 'POST /cache/analytics',
+      decisionsEndpoint: 'GET /cache/decisions',
+    });
   });
 
   app.get('/cache/stats', async () => store.stats());
@@ -839,6 +902,38 @@ function asOptionalString(value: unknown, field: string): string | undefined {
 function asBoolean(value: unknown, field: string): boolean {
   if (typeof value !== 'boolean') throw new ValidationError(`${field} 必须是布尔值`);
   return value;
+}
+
+/** /cache/analytics 桶宽上限防护：区间最多切成多少个桶 */
+const MAX_ANALYTICS_BUCKETS = 10_000;
+
+function asPositiveInteger(value: unknown, field: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+    throw new ValidationError(`${field} 必须是正整数（秒）`);
+  }
+  return value;
+}
+
+/**
+ * 分析前缀规范化：
+ * - 完整 http/https URL => 走与缓存键相同的规范化（小写 host、排序 query 等）；
+ * - 非完整 URL 时，允许直接给「规范化后 URL 的字面前缀」（如 https://api.example.test/v1/），
+ *   只做 trim，不做解析，便于按目录 / host 聚合。
+ */
+function normalizeAnalyticsPrefix(raw: string): string {
+  const prefix = raw.trim();
+  if (prefix === '') throw new ValidationError('urlPrefix 必须是非空字符串');
+  if (/^https?:\/\//i.test(prefix)) {
+    try {
+      return normalizeUrl(prefix).normalized;
+    } catch (err) {
+      if (err instanceof NormalizeError) {
+        throw new ValidationError(`urlPrefix 不是合法 URL: ${err.message}`);
+      }
+      throw err;
+    }
+  }
+  return prefix;
 }
 
 /** 按原因聚合计数跳过项，便于一眼看出各变体被跳过的原因 */

@@ -5,6 +5,7 @@
  * 用法：npm run smoke
  */
 import { buildServer } from '../src/index';
+import { ANALYTICS_STATE_NAMES } from '../src/analytics';
 import { FastifyInstance } from 'fastify';
 
 let passed = 0;
@@ -476,6 +477,181 @@ async function main(): Promise<void> {
   check('dryRun 非布尔 => 400', r.status === 400);
   r = await call(app, 'POST', '/admin/invalidate', { url: 'bad-url' });
   check('坏 URL => 400', r.status === 400);
+
+  console.log('\n[16] /cache/analytics：虚拟时间桶聚合（只读）');
+  await call(app, 'POST', '/admin/reset');
+
+  // 预置：fresh 条目、SWR 条目、短命（过期）条目
+  await call(app, 'POST', '/admin/entries', {
+    url: 'https://ana.test/fresh',
+    responseHeaders: { 'cache-control': 'max-age=600' },
+    body: 'f',
+    storedAt: T0,
+  });
+  await call(app, 'POST', '/admin/entries', {
+    url: 'https://ana.test/swr',
+    responseHeaders: { 'cache-control': 'max-age=60, stale-while-revalidate=300' },
+    body: 's',
+    storedAt: T0,
+  });
+  await call(app, 'POST', '/admin/entries', {
+    url: 'https://ana.test/expired',
+    responseHeaders: { 'cache-control': 'max-age=10' },
+    body: 'e',
+    storedAt: T0,
+  });
+
+  // 桶 0 [0,60s)：两个 fresh（Age 10s/20s）
+  await call(app, 'POST', '/cache/request', { url: 'https://ana.test/fresh', virtualTime: T0 + 10_000 });
+  await call(app, 'POST', '/cache/request', { url: 'https://ana.test/fresh', virtualTime: T0 + 20_000 });
+  // 桶 1 [60,120s)：1 个 expired（Age 70s）+ SWR 领队（90s）与加入者（95s）
+  await call(app, 'POST', '/cache/request', { url: 'https://ana.test/expired', virtualTime: T0 + 70_000 });
+  const swrLeader = await call(app, 'POST', '/cache/request', {
+    url: 'https://ana.test/swr', virtualTime: T0 + 90_000,
+  });
+  check('SWR 90s 为领队', swrLeader.json.token?.leader === true);
+  await call(app, 'POST', '/cache/request', { url: 'https://ana.test/swr', virtualTime: T0 + 95_000 });
+  // 桶 2 [120,180s)：miss 领队 + waiting 加入者 + bypass
+  await call(app, 'POST', '/cache/request', { url: 'https://ana.test/miss', virtualTime: T0 + 130_000 });
+  await call(app, 'POST', '/cache/request', { url: 'https://ana.test/miss', virtualTime: T0 + 140_000 });
+  await call(app, 'POST', '/cache/request', {
+    url: 'https://ana.test/ns', virtualTime: T0 + 150_000, headers: { 'cache-control': 'no-store' },
+  });
+  // 桶 3 [180,240s)：gateway-timeout
+  await call(app, 'POST', '/cache/request', {
+    url: 'https://ana.test/oic-missing',
+    headers: { 'cache-control': 'only-if-cached' },
+    virtualTime: T0 + 200_000,
+  });
+  // stale（max-stale 显式接受陈旧，Age 120s），落在桶 2
+  await call(app, 'POST', '/cache/request', {
+    url: 'https://ana.test/expired',
+    headers: { 'cache-control': 'max-stale=600' },
+    virtualTime: T0 + 120_000,
+  });
+
+  const decisionsBefore = (await call(app, 'GET', '/cache/stats')).json.decisions;
+  const entriesBefore = (await call(app, 'GET', '/cache/stats')).json.entries;
+
+  r = await call(app, 'POST', '/cache/analytics', {
+    virtualFrom: T0, virtualTo: T0 + 5 * minute, bucketSeconds: 60,
+  });
+  check('analytics 返回 200', r.status === 200);
+  const a = r.json;
+  check('桶按起点升序且区间被全覆盖（含空桶）', a.buckets.length === 5 &&
+    a.buckets.every((b: any, i: number) => b.bucketStart === T0 + i * minute &&
+      b.bucketEnd === b.bucketStart + minute && b.partial === false));
+  check('桶 0：2 fresh、p95=20s、无单飞', a.buckets[0].counts.fresh === 2 &&
+    a.buckets[0].ageP95Ms === 20_000 && a.buckets[0].ageP95Seconds === 20 &&
+    a.buckets[0].singleFlight === 0 && a.buckets[0].leaderRate === null);
+  check('桶 1：1 expired + 2 SWR，p95=95s', a.buckets[1].counts.expired === 1 &&
+    a.buckets[1].counts['stale-while-revalidate'] === 2 &&
+    a.buckets[1].ageP95Ms === 95_000 && a.buckets[1].ageSamples === 3);
+  check('桶 1：SWR 单飞 1 领队 / 2 参与 = 0.5；expired 也有领队', a.buckets[1].singleFlight === 3 &&
+    a.buckets[1].leaders === 2 && a.buckets[1].leaderRate === 2 / 3);
+  check('桶 2：2 miss + 1 bypass + 1 stale（Age 120s）；miss/bypass 无 Age',
+    a.buckets[2].counts.miss === 2 && a.buckets[2].counts.bypass === 1 &&
+    a.buckets[2].counts.stale === 1 && a.buckets[2].ageSamples === 1 &&
+    a.buckets[2].ageP95Ms === 120_000 && a.buckets[2].ageP95Seconds === 120);
+  check('桶 2：单飞为 2 个 miss（领队+等待）+ 1 个 bypass，共 2 领队',
+    a.buckets[2].singleFlight === 3 && a.buckets[2].leaders === 2);
+  check('桶 3：1 gateway-timeout，无单飞', a.buckets[3].counts['gateway-timeout'] === 1 &&
+    a.buckets[3].singleFlight === 0 && a.buckets[3].leaderRate === null);
+  check('桶 4 为空桶：total=0、七状态全 0、p95 与领队率为 null',
+    a.buckets[4].total === 0 &&
+    ANALYTICS_STATE_NAMES.every((s) => a.buckets[4].counts[s] === 0) &&
+    a.buckets[4].ageP95Ms === null && a.buckets[4].leaderRate === null);
+  check('summary 汇总七状态与总数 10', a.summary.total === 10 &&
+    a.summary.counts.fresh === 2 && a.summary.counts['stale-while-revalidate'] === 2 &&
+    a.summary.counts.stale === 1 && a.summary.counts.expired === 1 &&
+    a.summary.counts.miss === 2 && a.summary.counts.bypass === 1 &&
+    a.summary.counts['gateway-timeout'] === 1 && a.matchedRows === 10);
+  check('summary 全区间单飞 6 参与 4 领队（率 2/3）；6 个 Age 样本 p95=120s',
+    a.summary.singleFlight === 6 && a.summary.leaders === 4 &&
+    a.summary.leaderRate === 4 / 6 && a.summary.ageSamples === 6 &&
+    a.summary.ageP95Ms === 120_000 && a.summary.ageP95Seconds === 120);
+
+  // 半开区间：恰在 virtualFrom 的判定计入，恰在 virtualTo 的不计入
+  r = await call(app, 'POST', '/cache/analytics', {
+    virtualFrom: T0 + 60_000, virtualTo: T0 + 120_000, bucketSeconds: 60,
+  });
+  check('半开 [from,to)：仅桶 1 的 3 条（expired70 / SWR90 / SWR95）',
+    r.json.matchedRows === 3 &&
+    r.json.buckets.length === 1 && r.json.buckets[0].total === 3);
+
+  // 非整数倍区间：尾桶截断并标记 partial
+  r = await call(app, 'POST', '/cache/analytics', {
+    virtualFrom: T0, virtualTo: T0 + 90_000, bucketSeconds: 60,
+  });
+  check('尾桶按 virtualTo 截断且 partial=true', r.json.buckets.length === 2 &&
+    r.json.buckets[0].partial === false && r.json.buckets[1].partial === true &&
+    r.json.buckets[1].bucketEnd === T0 + 90_000);
+
+  // URL 前缀过滤：完整 URL 会被规范化（大写 host、乱序 query），裸前缀按字面量
+  r = await call(app, 'POST', '/cache/analytics', {
+    virtualFrom: T0, virtualTo: T0 + 5 * minute, bucketSeconds: 60,
+    urlPrefix: 'https://ANA.TEST/swr',
+  });
+  check('大写 host 前缀规范化后仍只命中 SWR 两条', r.json.urlPrefix === 'https://ana.test/swr' &&
+    r.json.matchedRows === 2 && r.json.summary.counts['stale-while-revalidate'] === 2);
+  r = await call(app, 'POST', '/cache/analytics', {
+    virtualFrom: T0, virtualTo: T0 + 5 * minute, bucketSeconds: 60,
+    urlPrefix: 'https://ana.test/',
+  });
+  check('目录前缀命中全部 10 条', r.json.matchedRows === 10);
+  r = await call(app, 'POST', '/cache/analytics', {
+    virtualFrom: T0, virtualTo: T0 + 5 * minute, bucketSeconds: 60,
+    urlPrefix: 'https://other.test/',
+  });
+  check('不匹配前缀 => 全空桶', r.json.matchedRows === 0 &&
+    r.json.buckets.every((b: any) => b.total === 0));
+
+  // 非法参数 => 400
+  r = await call(app, 'POST', '/cache/analytics', { virtualFrom: T0 + 1, virtualTo: T0, bucketSeconds: 60 });
+  check('from >= to => 400', r.status === 400);
+  r = await call(app, 'POST', '/cache/analytics', { virtualFrom: T0, virtualTo: T0, bucketSeconds: 60 });
+  check('from == to => 400', r.status === 400);
+  r = await call(app, 'POST', '/cache/analytics', { virtualFrom: T0, virtualTo: T0 + minute, bucketSeconds: 0 });
+  check('bucketSeconds=0 => 400', r.status === 400);
+  r = await call(app, 'POST', '/cache/analytics', { virtualFrom: T0, virtualTo: T0 + minute, bucketSeconds: 1.5 });
+  check('bucketSeconds 非整数 => 400', r.status === 400);
+  r = await call(app, 'POST', '/cache/analytics', { virtualFrom: 'nope', virtualTo: T0, bucketSeconds: 60 });
+  check('非法 virtualFrom => 400', r.status === 400);
+  r = await call(app, 'POST', '/cache/analytics', { virtualFrom: T0, virtualTo: T0, bucketSeconds: 60, urlPrefix: 123 });
+  check('urlPrefix 非字符串 => 400', r.status === 400);
+  r = await call(app, 'POST', '/cache/analytics', {
+    virtualFrom: T0, virtualTo: T0 + 20_000 * minute, bucketSeconds: 1,
+  });
+  check('桶数超 10000 上限 => 400', r.status === 400);
+
+  // 只读：分析前后 decisions / entries 数量不变，缓存仍可正常服务
+  const statsAfter = await call(app, 'GET', '/cache/stats');
+  check('analytics 不写 decision_logs / 不改 entries',
+    statsAfter.json.decisions === decisionsBefore && statsAfter.json.entries === entriesBefore);
+  r = await call(app, 'POST', '/cache/request', { url: 'https://ana.test/fresh', virtualTime: T0 + 5_000 });
+  check('分析后缓存数据仍可正常 fresh 服务', r.json.state === 'fresh');
+
+  console.log('\n[17] p95 最近邻排名（nearest-rank，ceil(0.95n)）');
+  await call(app, 'POST', '/admin/reset');
+  await call(app, 'POST', '/admin/entries', {
+    url: 'https://p95.test/a',
+    responseHeaders: { 'cache-control': 'max-age=100000' },
+    body: 'p',
+    storedAt: T0,
+  });
+  // 20 个样本，Age 1s..20s；nearest-rank => 第 ceil(19)=19 个 => 19s
+  for (let i = 1; i <= 20; i++) {
+    const rr = await call(app, 'POST', '/cache/request', {
+      url: 'https://p95.test/a', virtualTime: T0 + i * 1000,
+    });
+    check('p95 样本请求全部 fresh', rr.json.state === 'fresh');
+  }
+  r = await call(app, 'POST', '/cache/analytics', {
+    virtualFrom: T0, virtualTo: T0 + minute, bucketSeconds: 60,
+  });
+  check('20 样本 p95 取第 19 名 = 19000ms（最近邻排名）',
+    r.json.summary.ageSamples === 20 && r.json.summary.ageP95Ms === 19_000 &&
+    r.json.buckets[0].ageP95Ms === 19_000);
 
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   await app.close();
