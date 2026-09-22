@@ -1,0 +1,23 @@
+{
+  "name": "http-cache-lab",
+  "version": "1.0.0",
+  "description": "HTTP 缓存策略演练服务：虚拟时间 + 可解释的缓存判定 + 回源令牌单飞控制",
+  "main": "dist/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "smoke": "ts-node scripts/smoke.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "fastify": "^4.29.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^20.17.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.0"
+  }
+}

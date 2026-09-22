@@ -1,0 +1,43 @@
+services:
+  http-cache-lab:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: http-cache-lab:latest
+    container_name: http-cache-lab
+    ports:
+      - "8080:8080"
+    volumes:
+      - cache-lab-data:/data
+    environment:
+      DB_PATH: /data/cache-lab.db
+      HOST: 0.0.0.0
+      PORT: "8080"
+      LOG_LEVEL: info
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # 一次性的容器内端到端断言（含条件失效场景），不发布端口：
+  #   docker compose run --build smoke
+  smoke:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: http-cache-lab:latest
+    profiles: ["smoke"]
+    environment:
+      LOG_LEVEL: error
+    command: ["node", "dist/scripts/smoke.js"]
+    restart: "no"
+
+volumes:
+  cache-lab-data:

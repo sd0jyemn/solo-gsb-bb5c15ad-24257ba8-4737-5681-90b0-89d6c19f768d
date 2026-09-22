@@ -1,0 +1,9 @@
+node_modules/
+dist/
+data/
+*.db
+*.db-shm
+*.db-wal
+npm-debug.log*
+tmp/
+.DS_Store
