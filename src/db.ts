@@ -166,6 +166,8 @@ export class CacheStore {
         trail_json     TEXT NOT NULL,
         wall_time      INTEGER NOT NULL
       );
+      CREATE INDEX IF NOT EXISTS idx_decision_logs_virtual_time
+        ON decision_logs(virtual_time);
 
       CREATE TABLE IF NOT EXISTS invalidation_logs (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -764,6 +766,47 @@ export class CacheStore {
     }));
   }
 
+  /**
+   * 分析端点专用只读查询：按虚拟时间半开区间 [virtualFrom, virtualTo)
+   * 与可选的规范化 URL 前缀取判定日志，按虚拟时间、id 稳定排序。
+   * 不解析 trail（Age 由调用方按需提取），避免无谓的 JSON 开销。
+   */
+  queryDecisionLogsForAnalytics(params: {
+    virtualFrom: number;
+    virtualTo: number;
+    normalizedUrlPrefix?: string;
+  }): Array<{
+    id: number;
+    virtual_time: number;
+    state: string;
+    action: string;
+    normalized_url: string | null;
+    trail_json: string;
+  }> {
+    const conditions = ['virtual_time >= ?', 'virtual_time < ?'];
+    const args: unknown[] = [params.virtualFrom, params.virtualTo];
+    if (params.normalizedUrlPrefix !== undefined) {
+      conditions.push("normalized_url LIKE ? ESCAPE '\\'");
+      args.push(likePrefix(params.normalizedUrlPrefix));
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT id, virtual_time, state, action, normalized_url, trail_json
+           FROM decision_logs
+          WHERE ${conditions.join(' AND ')}
+          ORDER BY virtual_time ASC, id ASC`
+      )
+      .all(...args) as Array<{
+      id: number;
+      virtual_time: number;
+      state: string;
+      action: string;
+      normalized_url: string | null;
+      trail_json: string;
+    }>;
+    return rows;
+  }
+
   // —— 重置 / 统计 ——
 
   reset(): void {
@@ -797,6 +840,11 @@ export class CacheStore {
 function readEtag(responseHeadersJson: string): string | null {
   const headers = JSON.parse(responseHeadersJson) as HeaderMap;
   return headers['etag'] ?? null;
+}
+
+/** 构造前缀匹配的 LIKE 参数：转义通配符后补 % */
+function likePrefix(prefix: string): string {
+  return prefix.replace(/[\\%_]/g, (c) => '\\' + c) + '%';
 }
 
 function parseVaryNames(value: string | undefined): string[] {  if (!value) return [];

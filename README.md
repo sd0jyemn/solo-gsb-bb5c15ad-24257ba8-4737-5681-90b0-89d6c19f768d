@@ -7,6 +7,7 @@
 - 观察并发请求命中同一需回源键时的**单飞回源令牌**（single-flight token）编排；
 - 逐步核对每次判定输出的**解释轨迹**（trail）；
 - 按方法 + URL + 请求头**精确解析 Vary 变体**做**条件失效**（ETag 守卫、dryRun 预览、释放 pending 令牌、全程留痕）；
+- 用 `POST /cache/analytics` 把判定日志按**虚拟时间半开桶**聚合（七种状态计数、Age 的 p95、单飞领队率）；
 - 一键重置整个演练状态。
 
 技术栈：TypeScript · Fastify 4 · better-sqlite3（同步驱动，天然避免回源竞态）。
@@ -45,7 +46,7 @@ npm ci
 npm run build
 DB_PATH=./data/lab.db npm start          # 生产模式
 DB_PATH=:memory: npm run dev             # 开发模式（内存库）
-npm run smoke                            # 84 项端到端断言
+npm run smoke                            # 107 项端到端断言
 ```
 
 环境变量：
@@ -207,6 +208,112 @@ curl -s 'localhost:8080/admin/invalidations?limit=10'
 
 ---
 
+## 端到端示例：按虚拟时间桶分析判定日志
+
+先制造一批判定（沿用上面 `T0` 与已预置的 `/feed`），再按 60 秒一桶聚合 `decision_logs`：
+
+```bash
+# fresh（t+5s）/ SWR（t+75s）/ expired（t+125s）各来一次
+curl -s -X POST localhost:8080/cache/request -H 'content-type: application/json' -d '{
+  "url": "https://api.example.test/feed", "virtualTime": '$((T0+5000))'
+}' >/dev/null
+curl -s -X POST localhost:8080/cache/request -H 'content-type: application/json' -d '{
+  "url": "https://api.example.test/feed", "virtualTime": '$((T0+75000))'
+}' >/dev/null
+curl -s -X POST localhost:8080/cache/request -H 'content-type: application/json' -d '{
+  "url": "https://api.example.test/feed", "virtualTime": '$((T0+125000))'
+}' >/dev/null
+
+# 时间桶分析：[T0, T0+180s)，60s 一桶，只看 /feed 前缀
+curl -s -X POST localhost:8080/cache/analytics -H 'content-type: application/json' -d '{
+  "virtualFrom": 1767225600000,
+  "virtualTo": "2026-01-01T00:03:00Z",
+  "urlPrefix": "https://api.example.test/feed",
+  "bucketSeconds": 60
+}'
+```
+
+响应（桶始终按 `bucketStart` 升序返回，空桶也会列出）：
+
+```json
+{
+  "virtualFrom": 1767225600000,
+  "virtualTo": 1767225780000,
+  "bucketSeconds": 60,
+  "bucketMs": 60000,
+  "urlPrefix": "https://api.example.test/feed",
+  "normalizedUrlPrefix": "https://api.example.test/feed",
+  "matched": 3,
+  "buckets": [
+    {
+      "bucketStart": 1767225600000,
+      "bucketEnd": 1767225660000,
+      "count": 1,
+      "fresh": 1,
+      "stale-while-revalidate": 0,
+      "stale": 0,
+      "expired": 0,
+      "miss": 0,
+      "bypass": 0,
+      "gateway-timeout": 0,
+      "ageSamples": 1,
+      "ageP95Ms": 5000,
+      "ageP95Seconds": 5,
+      "singleFlightLeaders": 0,
+      "singleFlight": 0,
+      "singleFlightLeaderRate": null
+    },
+    {
+      "bucketStart": 1767225660000,
+      "bucketEnd": 1767225720000,
+      "count": 1,
+      "fresh": 0,
+      "stale-while-revalidate": 1,
+      "stale": 0,
+      "expired": 0,
+      "miss": 0,
+      "bypass": 0,
+      "gateway-timeout": 0,
+      "ageSamples": 1,
+      "ageP95Ms": 75000,
+      "ageP95Seconds": 75,
+      "singleFlightLeaders": 1,
+      "singleFlight": 1,
+      "singleFlightLeaderRate": 1
+    },
+    {
+      "bucketStart": 1767225720000,
+      "bucketEnd": 1767225780000,
+      "count": 1,
+      "fresh": 0,
+      "stale-while-revalidate": 0,
+      "stale": 0,
+      "expired": 1,
+      "miss": 0,
+      "bypass": 0,
+      "gateway-timeout": 0,
+      "ageSamples": 1,
+      "ageP95Ms": 125000,
+      "ageP95Seconds": 125,
+      "singleFlightLeaders": 1,
+      "singleFlight": 1,
+      "singleFlightLeaderRate": 1
+    }
+  ]
+}
+```
+
+要点：
+
+- **半开时间桶**：区间为 `[virtualFrom, virtualTo)`，桶为 `[bucketStart, bucketStart + bucketMs)`，桶锚定 `virtualFrom`（不按整点对齐）；恰好落在 `virtualTo` 上的日志不计入，区间不必被桶宽整除（最后一个桶截到 `virtualTo`）。
+- **状态计数**：每桶分别统计 `fresh` / `stale-while-revalidate` / `stale` / `expired` / `miss` / `bypass` / `gateway-timeout`。
+- **Age p95**：对桶内每次判定的 `Age = virtualTime − storedAt` 取 p95，采用**最近邻排名**（rank = ⌈0.95·n⌉，升序第 rank 个值）；`miss` / `bypass` / `gateway-timeout` 没有 Age、不进入样本。桶内没有任何 Age 样本（含空桶）时 `ageP95Ms` / `ageP95Seconds` 为 `null`，样本数见 `ageSamples`。
+- **单飞领队率** `singleFlightLeaderRate = singleFlightLeaders / singleFlight`：`singleFlight` 统计该桶所有进入回源单飞编排的请求（动作 `must-revalidate` / `served-stale-and-revalidate` / `waiting` / `served-stale-joining-revalidation`，注意 `no-store` 的 `bypass` 也会签发令牌），领队为前两者；桶内没有回源请求时比率为 `null`。
+- **URL 前缀**：`urlPrefix` 可省略；给出时先按与缓存键相同的规则规范化（host 小写、query 排序等），再对判定日志的规范化 URL 做前缀匹配，因此 `https://API.example.test/feed` 与 `https://api.example.test/feed` 等价。
+- **只读**：分析端点不修改任何缓存数据，也不写日志；区间非法（`virtualTo ≤ virtualFrom`）、`bucketSeconds` 非正整数、时间/前缀无法解析、桶数超过 10000 上限时返回 **400**。
+
+---
+
 ## 缓存模型
 
 ### 虚拟时间
@@ -296,6 +403,7 @@ Vary 变体查找：先按「方法 + 规范化 URL」筛候选条目，再用�
 | `GET` | `/cache/tokens?all=0` | 令牌列表（默认仅 pending） |
 | `GET` | `/cache/entries?limit=100` | 预置/回源后的缓存条目 |
 | `GET` | `/cache/decisions?limit=100` | 历史判定（含完整 trail） |
+| `POST` | `/cache/analytics` | 按虚拟时间半开桶聚合判定（状态计数 / Age p95 / 单飞领队率） |
 | `GET` | `/cache/stats` | entries / pendingTokens / decisions 计数 |
 | `POST` | `/admin/entries` | 预置模拟响应 |
 | `DELETE` | `/admin/entries/:cacheKey` | 删除单个条目 |
@@ -352,6 +460,36 @@ Vary 变体查找：先按「方法 + 规范化 URL」筛候选条目，再用�
 ```
 
 `responseHeaders` 与 `headers` 二者皆可（后者优先）；`body` 为字符串或 `null`。
+
+### `POST /cache/analytics`
+
+只读分析端点：按虚拟时间从 `decision_logs` 取半开区间 `[virtualFrom, virtualTo)` 内的判定（可选 `urlPrefix` 过滤），以 `virtualFrom` 为锚点切成 `bucketSeconds` 宽的半开桶并聚合。请求体：
+
+```json
+{
+  "virtualFrom": 1767225600000,
+  "virtualTo": "2026-01-01T00:03:00Z",
+  "urlPrefix": "https://api.example.test/feed",
+  "bucketSeconds": 60
+}
+```
+
+- `virtualFrom` / `virtualTo`：整数毫秒或任何 `Date.parse` 能解析的字符串；必须满足 `virtualTo > virtualFrom`，否则 **400**。
+- `bucketSeconds`：必填，正整数秒；桶数 `⌈(virtualTo − virtualFrom) / 桶宽⌉` 超过 10000 时 **400**。
+- `urlPrefix`：可选，按缓存键同一套 URL 规范化规则处理后做前缀匹配；非法 URL 返回 **400**。
+
+响应顶层：`virtualFrom` / `virtualTo`（毫秒）、`bucketSeconds` / `bucketMs`、`urlPrefix` 与 `normalizedUrlPrefix`（未给前缀时均为 `null`）、`matched`（区间内命中的判定总数）、`buckets`（按 `bucketStart` 升序，含空桶）。每个桶：
+
+| 字段 | 含义 |
+| --- | --- |
+| `bucketStart` / `bucketEnd` | 桶的半开区间（毫秒）；最后一个桶截到 `virtualTo` |
+| `count` | 落入本桶的判定数（七状态计数之和） |
+| `fresh` / `stale-while-revalidate` / `stale` / `expired` / `miss` / `bypass` / `gateway-timeout` | 各状态判定数 |
+| `ageSamples` | 桶内有 Age 的判定数（命中缓存条目者；miss/bypass/gateway-timeout 不计） |
+| `ageP95Ms` / `ageP95Seconds` | Age 的 p95（最近邻排名 rank=⌈0.95·n⌉），秒按 Age 头规则向下取整；无样本为 `null` |
+| `singleFlightLeaders` | 拿到回源令牌任领队的请求数（`must-revalidate` + `served-stale-and-revalidate`） |
+| `singleFlight` | 进入单飞编排的请求数（领队 + `waiting` + `served-stale-joining-revalidation`） |
+| `singleFlightLeaderRate` | `singleFlightLeaders / singleFlight`，保留 6 位小数；`singleFlight=0` 时为 `null` |
 
 ### `POST /admin/invalidate`
 
@@ -433,6 +571,7 @@ curl -s 'localhost:8080/admin/invalidations?limit=20'
 5. **Vary 变体**：预置同一 URL 的 `gzip` / `br` 两个变体，换请求头观察键材料与命中差异。
 6. **URL 规范化**：用乱序 query、大小写 host、默认端口、fragment 等形式请求同一资源，对比 `normalizedUrl` 与 `cacheKey`。
 7. **条件失效**：预置 `gzip` / `br` 两个 ETag 不同的变体 → 先 `dryRun` 确认只选中 gzip 且 br 出现在 `variant-miss` → 用错误的 `expectedEtag` 执行被 `etag-mismatch` 拦下 → 用正确 ETag 执行后确认 gzip 删除、br 仍命中、pending 令牌被释放。
+8. **时间桶分析**：在一段虚拟时间内制造 fresh / SWR / expired / miss / 并发单飞混合流量 → `POST /cache/analytics` 按桶核对七状态计数、Age p95（最近邻排名、空桶 `null`）与单飞领队率；再用 `urlPrefix` 只看某个资源、用半开边界确认端点不计入。
 
 ---
 
@@ -451,10 +590,11 @@ src/
   index.ts          Fastify 启动与错误处理
   routes.ts         HTTP 端点与单飞编排
   freshness.ts      纯函数：新鲜度判定与轨迹生成
+  analytics.ts      纯函数：判定日志的虚拟时间桶聚合（p95 / 领队率）
   canonical.ts      URL 规范化、Vary 解析、缓存键计算
   cache-control.ts  Cache-Control 指令解析（请求/响应共用）
   http-date.ts      IMF-fixdate / RFC850 / asctime 解析与格式化
   db.ts             SQLite 表、条目写入、原子令牌签发与提交、条件失效事务
   util.ts           时间/头/指纹等工具
-scripts/smoke.ts    端到端断言（84 项）
+scripts/smoke.ts    端到端断言（107 项）
 ```

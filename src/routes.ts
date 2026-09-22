@@ -13,6 +13,10 @@ import {
 } from './canonical';
 import { evaluateFreshness, FreshnessResult } from './freshness';
 import { formatHttpDate, parseHttpDate } from './http-date';
+import {
+  buildAnalyticsBuckets,
+  extractAgeMsFromTrail,
+} from './analytics';
 import { EntryRow, HeaderMap, TrailStep } from './types';
 import {
   generateRequestId,
@@ -56,6 +60,17 @@ interface InvalidatePayload {
   requestId?: unknown;
 }
 
+interface AnalyticsPayload {
+  virtualFrom?: unknown;
+  virtualTo?: unknown;
+  /** 规范化后对 normalized_url 做前缀匹配（可给完整 URL 或前缀形式） */
+  urlPrefix?: unknown;
+  bucketSeconds?: unknown;
+}
+
+/** 分析端点最多生成的桶数，防止区间/桶宽不合理时产出巨型响应 */
+const MAX_ANALYTICS_BUCKETS = 10000;
+
 export default function registerRoutes(app: FastifyInstance, store: CacheStore): void {
   // —— 基础信息 ——
   app.get('/', async () => ({
@@ -70,6 +85,7 @@ export default function registerRoutes(app: FastifyInstance, store: CacheStore):
       'GET  /cache/tokens': '查看令牌（?all=1 含已结束）',
       'GET  /cache/entries': '查看缓存条目',
       'GET  /cache/decisions': '查看判定轨迹日志',
+      'POST /cache/analytics': '按虚拟时间桶聚合判定日志（状态计数 / Age p95 / 单飞领队率）',
       'GET  /cache/stats': '计数',
       'POST /admin/entries': '预置模拟响应',
       'DELETE /admin/entries/:cacheKey': '删除单个条目',
@@ -427,6 +443,78 @@ export default function registerRoutes(app: FastifyInstance, store: CacheStore):
   app.get('/cache/decisions', async (req) => {
     const q = req.query as { limit?: string };
     return { decisions: store.listDecisionLogs(clampLimit(q.limit)) };
+  });
+
+  // —— 只读分析：按虚拟时间半开桶聚合判定日志 ——
+  app.post('/cache/analytics', async (req, reply) => {
+    const body = (req.body ?? {}) as AnalyticsPayload;
+
+    const virtualFrom = parseVirtualTime(body.virtualFrom, 'virtualFrom');
+    const virtualTo = parseVirtualTime(body.virtualTo, 'virtualTo');
+    if (!(virtualTo > virtualFrom)) {
+      throw new ValidationError(
+        `区间非法：要求 virtualTo > virtualFrom（收到 ${virtualFrom} ~ ${virtualTo}）`
+      );
+    }
+
+    let bucketSeconds: number;
+    if (body.bucketSeconds === undefined || body.bucketSeconds === null) {
+      throw new ValidationError('bucketSeconds 缺失：必须是正整数秒');
+    }
+    if (
+      typeof body.bucketSeconds !== 'number' ||
+      !Number.isFinite(body.bucketSeconds) ||
+      !Number.isInteger(body.bucketSeconds) ||
+      body.bucketSeconds <= 0
+    ) {
+      throw new ValidationError('bucketSeconds 必须是正整数秒');
+    }
+    bucketSeconds = body.bucketSeconds;
+    const bucketMs = bucketSeconds * 1000;
+
+    // 桶锚定 virtualFrom：拒绝生成海量空桶的请求
+    const bucketCount = Math.ceil((virtualTo - virtualFrom) / bucketMs);
+    if (bucketCount > MAX_ANALYTICS_BUCKETS) {
+      throw new ValidationError(
+        `桶数量 ${bucketCount} 超过上限 ${MAX_ANALYTICS_BUCKETS}：请加大 bucketSeconds 或缩小查询区间`
+      );
+    }
+
+    // 可选 URL 前缀：先按同一套规则规范化，再对 normalized_url 做前缀匹配
+    let normalizedUrlPrefix: string | undefined;
+    const rawPrefix = asOptionalString(body.urlPrefix, 'urlPrefix');
+    if (rawPrefix !== undefined) {
+      if (rawPrefix.trim() === '') throw new ValidationError('urlPrefix 必须是非空字符串');
+      normalizedUrlPrefix = normalizeUrl(rawPrefix).normalized;
+    }
+
+    const rows = store.queryDecisionLogsForAnalytics({
+      virtualFrom,
+      virtualTo,
+      normalizedUrlPrefix,
+    });
+    const aggregated = buildAnalyticsBuckets(
+      rows.map((r) => ({
+        virtual_time: r.virtual_time,
+        state: r.state,
+        action: r.action,
+        ageMs: extractAgeMsFromTrail(r.trail_json),
+      })),
+      virtualFrom,
+      virtualTo,
+      bucketMs
+    );
+
+    return reply.code(200).send({
+      virtualFrom,
+      virtualTo,
+      bucketSeconds,
+      bucketMs,
+      urlPrefix: rawPrefix ?? null,
+      normalizedUrlPrefix: normalizedUrlPrefix ?? null,
+      matched: rows.length,
+      buckets: aggregated,
+    });
   });
 
   app.get('/cache/stats', async () => store.stats());
